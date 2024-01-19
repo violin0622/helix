@@ -11,6 +11,33 @@ use crate::surround;
 use crate::syntax::LanguageConfiguration;
 use crate::Range;
 
+fn word_boundary(slice: RopeSlice, pos: usize, direct: Direction, long: bool) -> usize {
+    use Direction::{Backward, Forward};
+    let pos_category = categorize_char(slice.char(pos));
+    match direct {
+        Forward => {
+            if pos >= slice.len_chars() - 1 {
+                return slice.len_chars();
+            }
+            slice
+                .chars_at(pos)
+                .position(|c| categorize_char(c) != pos_category)
+                .unwrap_or(slice.len_chars())
+        }
+        Backward => {
+            if pos <= 1 {
+                return 0;
+            }
+            slice
+                .chars_at(pos)
+                .reversed()
+                .position(|c| categorize_char(c) != pos_category)
+                .map(|x| x + 1)
+                .unwrap_or(0)
+        }
+    }
+}
+
 fn find_word_boundary(slice: RopeSlice, mut pos: usize, direction: Direction, long: bool) -> usize {
     use CharCategory::{Eol, Whitespace};
 
@@ -79,10 +106,14 @@ pub fn textobject_word(
     let pos = range.cursor(slice);
 
     let word_start = find_word_boundary(slice, pos, Direction::Backward, long);
-    let word_end = match slice.get_char(pos).map(categorize_char) {
-        None | Some(CharCategory::Whitespace | CharCategory::Eol) => pos,
-        _ => find_word_boundary(slice, pos + 1, Direction::Forward, long),
-    };
+    let word_end = find_word_boundary(slice, pos, Direction::Forward, long);
+    // let word_end = match slice.get_char(pos).map(categorize_char) {
+    //     None | Some(CharCategory::Whitespace | CharCategory::Eol) => pos,
+    //     _ => find_word_boundary(slice, pos + 1, Direction::Forward, long),
+    // };
+
+    println!("repe: {slice}, pos: {pos}, long:{long}");
+    println!(" start: {word_start}, end:{word_end}");
 
     // Special case.
     if word_start == word_end {
@@ -306,6 +337,7 @@ mod test {
             ),
             (
                 "cursor at middle of word",
+                //   0      7  x      7  x
                 vec![
                     (13, Inside, (10, 16)),
                     (10, Inside, (10, 16)),
@@ -584,5 +616,13 @@ mod test {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_word_boundary() {
+        let test_cases = &[("  word  ")]
+        let s = Rope::from_str("hello  world   ");
+        let pos = find_word_boundary(s.slice(..), 6, Direction::Forward, false);
+        println!("{pos}");
     }
 }
