@@ -3,7 +3,7 @@ use std::fmt::Display;
 use ropey::RopeSlice;
 use tree_sitter::{Node, QueryCursor};
 
-use crate::chars::{categorize_char, char_is_whitespace, CharCategory};
+use crate::chars::{categorize_char, char_is_line_ending, char_is_whitespace, CharCategory};
 use crate::graphemes::{next_grapheme_boundary, prev_grapheme_boundary};
 use crate::line_ending::rope_is_line_ending;
 use crate::movement::Direction;
@@ -11,30 +11,48 @@ use crate::surround;
 use crate::syntax::LanguageConfiguration;
 use crate::Range;
 
-fn word_boundary(slice: RopeSlice, pos: usize, direct: Direction, long: bool) -> usize {
+#[allow(dead_code)]
+fn word_boundary(slice: RopeSlice, pos: usize, direct: Direction, words: &[char]) -> usize {
     use Direction::{Backward, Forward};
-    let pos_category = categorize_char(slice.char(pos));
+
     match direct {
+        Forward if pos >= slice.len_chars().saturating_sub(1) => slice.len_chars(),
         Forward => {
-            if pos >= slice.len_chars() - 1 {
-                return slice.len_chars();
-            }
+            let cate = isword(slice.char(pos), words);
             slice
                 .chars_at(pos)
-                .position(|c| categorize_char(c) != pos_category)
-                .unwrap_or(slice.len_chars())
+                .position(|c| cate != isword(c, words))
+                .map_or(slice.len_chars(), |x| x + pos)
         }
+        Backward if pos == 0 => 0,
+        Backward if pos == slice.len_chars() => slice.len_chars(),
         Backward => {
-            if pos <= 1 {
-                return 0;
-            }
+            let cate = isword(slice.char(pos), words);
             slice
                 .chars_at(pos)
                 .reversed()
-                .position(|c| categorize_char(c) != pos_category)
-                .map(|x| x + 1)
-                .unwrap_or(0)
+                .position(|c| cate != isword(c, words))
+                .map_or(0, |x| pos - x)
         }
+    }
+}
+
+// sameword 判定 ch 是否属于 cs 和 cc 定义的 word 。
+fn isword(ch: char, cs: &[char]) -> bool {
+    ch.is_alphanumeric() || cs.iter().any(|&c| ch == c)
+}
+
+fn long_word(slice: RopeSlice, pos: usize, direct: Direction) -> usize {
+    match direct {
+        Direction::Forward => slice
+            .chars_at(pos)
+            .position(|c| char_is_whitespace(c) || char_is_line_ending(c))
+            .map_or(slice.len_chars(), |x| x + pos),
+        Direction::Backward => slice
+            .chars_at(pos)
+            .reversed()
+            .position(|c| char_is_whitespace(c) || char_is_line_ending(c))
+            .map_or(0, |x| pos - x),
     }
 }
 
@@ -106,14 +124,11 @@ pub fn textobject_word(
     let pos = range.cursor(slice);
 
     let word_start = find_word_boundary(slice, pos, Direction::Backward, long);
-    let word_end = find_word_boundary(slice, pos, Direction::Forward, long);
-    // let word_end = match slice.get_char(pos).map(categorize_char) {
-    //     None | Some(CharCategory::Whitespace | CharCategory::Eol) => pos,
-    //     _ => find_word_boundary(slice, pos + 1, Direction::Forward, long),
-    // };
-
-    println!("repe: {slice}, pos: {pos}, long:{long}");
-    println!(" start: {word_start}, end:{word_end}");
+    // let word_end = find_word_boundary(slice, pos, Direction::Forward, long);
+    let word_end = match slice.get_char(pos).map(categorize_char) {
+        None | Some(CharCategory::Whitespace | CharCategory::Eol) => pos,
+        _ => find_word_boundary(slice, pos + 1, Direction::Forward, long),
+    };
 
     // Special case.
     if word_start == word_end {
@@ -337,7 +352,6 @@ mod test {
             ),
             (
                 "cursor at middle of word",
-                //   0      7  x      7  x
                 vec![
                     (13, Inside, (10, 16)),
                     (10, Inside, (10, 16)),
@@ -620,9 +634,80 @@ mod test {
 
     #[test]
     fn test_word_boundary() {
-        let test_cases = &[("  word  ")]
-        let s = Rope::from_str("hello  world   ");
-        let pos = find_word_boundary(s.slice(..), 6, Direction::Forward, false);
-        println!("{pos}");
+        // &[text, [(position, direction, expected-word-boundary)...]]
+        let test_cases = &[
+            (
+                "  word  ",
+                vec![],
+                vec![
+                    (0, Direction::Forward, 2usize),
+                    (0, Direction::Backward, 0),
+                    (2, Direction::Forward, 6),
+                    (2, Direction::Backward, 2),
+                    (5, Direction::Forward, 6),
+                    (5, Direction::Backward, 2),
+                    (6, Direction::Forward, 8),
+                    (6, Direction::Backward, 6),
+                    (7, Direction::Forward, 8),
+                    (7, Direction::Backward, 6),
+                    (8, Direction::Forward, 8),
+                    (8, Direction::Backward, 8),
+                ],
+            ),
+            (
+                "a",
+                vec![],
+                vec![
+                    (0, Direction::Forward, 1),
+                    (0, Direction::Backward, 0),
+                    (1, Direction::Forward, 1),
+                    (1, Direction::Backward, 1),
+                ],
+            ),
+            (
+                "",
+                vec![],
+                vec![(0, Direction::Backward, 0), (0, Direction::Forward, 0)],
+            ),
+            (
+                "hello\nworld!",
+                vec![],
+                vec![
+                    (0, Direction::Forward, 5),
+                    (4, Direction::Forward, 5),
+                    (5, Direction::Forward, 6),
+                    (5, Direction::Backward, 5),
+                    (6, Direction::Forward, 11),
+                    (6, Direction::Backward, 6),
+                    (11, Direction::Forward, 12),
+                ],
+            ),
+            (
+                "hello-world!",
+                vec!['-'],
+                vec![
+                    (0, Direction::Forward, 11),
+                    (4, Direction::Forward, 11),
+                    (5, Direction::Forward, 11),
+                    (5, Direction::Backward, 0),
+                    (6, Direction::Backward, 0),
+                    (10, Direction::Backward, 0),
+                    (11, Direction::Backward, 11),
+                ],
+            ),
+        ];
+        test_cases.iter().enumerate().for_each(|(i, t)| {
+            let (text, words, case) = t;
+            case.iter().enumerate().for_each(|(j, &c)| {
+                let (pos, direct, expect) = c;
+                let txt = Rope::from_str(text);
+                let slice = txt.slice(..);
+                assert_eq!(
+                    word_boundary(slice, pos, direct, words),
+                    expect,
+                    "failed at case {i}.{j}",
+                );
+            });
+        });
     }
 }
