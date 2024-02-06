@@ -1,9 +1,11 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 use ropey::RopeSlice;
 use tree_sitter::{Node, QueryCursor};
 
-use crate::chars::{categorize_char, char_is_line_ending, char_is_whitespace, CharCategory};
+use crate::chars::{
+    categorize_char, char_is_line_ending, char_is_punctuation, char_is_whitespace, CharCategory,
+};
 use crate::graphemes::{next_grapheme_boundary, prev_grapheme_boundary};
 use crate::line_ending::rope_is_line_ending;
 use crate::movement::Direction;
@@ -11,48 +13,131 @@ use crate::surround;
 use crate::syntax::LanguageConfiguration;
 use crate::Range;
 
-#[allow(dead_code)]
-fn word_boundary(slice: RopeSlice, pos: usize, direct: Direction, words: &[char]) -> usize {
+fn word_boundary<P>(sp: TextPosition, direct: Direction, predicate: P) -> usize
+where
+    P: Fn(char) -> bool,
+{
     use Direction::{Backward, Forward};
-
     match direct {
-        Forward if pos >= slice.len_chars().saturating_sub(1) => slice.len_chars(),
+        Forward if sp.pos >= sp.text.len_chars().saturating_sub(1) => sp.text.len_chars(),
         Forward => {
-            let cate = isword(slice.char(pos), words);
-            slice
-                .chars_at(pos)
-                .position(|c| cate != isword(c, words))
-                .map_or(slice.len_chars(), |x| x + pos)
+            let kind = predicate(sp.text.char(sp.pos));
+            sp.text
+                .chars_at(sp.pos)
+                .position(|c| kind != predicate(c))
+                .map_or(sp.text.len_chars(), |x| x + sp.pos)
         }
-        Backward if pos == 0 => 0,
-        Backward if pos == slice.len_chars() => slice.len_chars(),
+        Backward if sp.pos == 0 => 0,
+        Backward if sp.pos == sp.text.len_chars() => sp.text.len_chars(),
         Backward => {
-            let cate = isword(slice.char(pos), words);
-            slice
-                .chars_at(pos)
+            let kind = predicate(sp.text.char(sp.pos));
+            sp.text
+                .chars_at(sp.pos)
                 .reversed()
-                .position(|c| cate != isword(c, words))
-                .map_or(0, |x| pos - x)
+                .position(|c| kind != predicate(c))
+                .map_or(0, |x| sp.pos - x)
         }
     }
 }
 
-// sameword 判定 ch 是否属于 cs 和 cc 定义的 word 。
-fn isword(ch: char, cs: &[char]) -> bool {
-    ch.is_alphanumeric() || cs.iter().any(|&c| ch == c)
+#[derive(Clone, Copy)]
+struct TextPosition<'a> {
+    text: RopeSlice<'a>,
+    pos: usize,
 }
 
-fn long_word(slice: RopeSlice, pos: usize, direct: Direction) -> usize {
-    match direct {
-        Direction::Forward => slice
-            .chars_at(pos)
-            .position(|c| char_is_whitespace(c) || char_is_line_ending(c))
-            .map_or(slice.len_chars(), |x| x + pos),
-        Direction::Backward => slice
-            .chars_at(pos)
-            .reversed()
-            .position(|c| char_is_whitespace(c) || char_is_line_ending(c))
-            .map_or(0, |x| pos - x),
+fn is_word(ch: char, cs: &[char]) -> bool {
+    ch.is_alphanumeric() || cs.contains(&ch)
+}
+
+fn is_long_word(ch: char) -> bool {
+    categorize_char(ch) == CharCategory::Word || char_is_punctuation(ch)
+}
+
+pub fn textobject_word2(
+    slice: RopeSlice,
+    range: Range,
+    textobject: TextObject,
+    _count: usize,
+    long: bool,
+) -> Range {
+    let mut tp = TextPosition {
+        text: slice,
+        pos: range.cursor(slice),
+    };
+    let word_chars = &['_'];
+
+    use TextObject::*;
+    match (textobject, long) {
+        (Inside, true) => {
+            let left = word_boundary(tp, Direction::Backward, is_long_word); // 让 newline 与任何类型都不同
+            let right = word_boundary(tp, Direction::Forward, is_long_word);
+            Range::new(left, right)
+        }
+        (Inside, false) => {
+            let left = word_boundary(tp, Direction::Backward, |c| is_word(c, word_chars));
+            let right = word_boundary(tp, Direction::Forward, |c| is_word(c, word_chars));
+            Range::new(left, right)
+        }
+        (Around, true) => {
+            let left = word_boundary(tp, Direction::Backward, is_long_word);
+            let mut right = word_boundary(tp, Direction::Forward, is_long_word);
+            if char_is_line_ending(slice.char(left)) || char_is_line_ending(slice.char(right)) {
+                return Range::new(left, right);
+            }
+            tp.pos = right;
+            right = word_boundary(tp, Direction::Forward, is_long_word);
+            Range::new(left, right)
+        }
+        (Around, false) => {
+            let left = word_boundary(tp, Direction::Backward, |c| is_word(c, word_chars));
+            let mut right = word_boundary(tp, Direction::Forward, |c| is_word(c, word_chars));
+            if char_is_whitespace(slice.char(left)) || char_is_whitespace(slice.char(right)) {
+                tp.pos = right;
+                right = word_boundary(tp, Direction::Forward, |c| is_word(c, word_chars));
+            }
+            return Range::new(left, right);
+        }
+        _ => unreachable!(),
+    }
+}
+
+// Around/Inside: 是否包含起末空白符
+// Long/Short: 是否包含换行符
+// 当行尾有空白符时， Around Short 的换行符会被截断，从而表现与 Inside Short 一样。
+pub fn textobject_line(
+    slice: RopeSlice,
+    range: Range,
+    textobject: TextObject,
+    _count: usize,
+    long: bool,
+) -> Range {
+    let pos = range.cursor(slice);
+    let mut tp = TextPosition { text: slice, pos };
+    let mut right = word_boundary(tp, Direction::Forward, char_is_line_ending);
+    let mut left = word_boundary(tp, Direction::Backward, char_is_line_ending);
+    use TextObject::*;
+    match (textobject, long) {
+        (Around, false) => {
+            if char_is_line_ending(slice.char(left)) {
+                tp.pos = tp.pos.saturating_sub(1);
+                left = word_boundary(tp, Direction::Backward, char_is_line_ending);
+                right = right.saturating_sub(1);
+            }
+            Range::new(left, right)
+        }
+        (Around, true) => {
+            if char_is_line_ending(slice.char(left)) {
+                tp.pos = tp.pos.saturating_sub(1);
+                left = word_boundary(tp, Direction::Backward, char_is_line_ending);
+                Range::new(left, right)
+            } else {
+                Range::new(left, slice.len_chars().min(right + 1))
+            }
+        }
+        (Inside, true) => todo!("search from both side that not white space"),
+        (Inside, false) => todo!(),
+        _ => unreachable!(),
     }
 }
 
@@ -635,7 +720,7 @@ mod test {
     #[test]
     fn test_word_boundary() {
         // &[text, [(position, direction, expected-word-boundary)...]]
-        let test_cases = &[
+        let word_cases = &[
             (
                 "  word  ",
                 vec![],
@@ -696,18 +781,153 @@ mod test {
                 ],
             ),
         ];
-        test_cases.iter().enumerate().for_each(|(i, t)| {
-            let (text, words, case) = t;
+
+        word_cases.iter().enumerate().for_each(|(i, t)| {
+            let (txt, words, case) = t;
             case.iter().enumerate().for_each(|(j, &c)| {
                 let (pos, direct, expect) = c;
-                let txt = Rope::from_str(text);
-                let slice = txt.slice(..);
+                let rope = Rope::from_str(txt);
+                let text = rope.slice(..);
                 assert_eq!(
-                    word_boundary(slice, pos, direct, words),
+                    // word_boundary(slice, pos, direct, words),
+                    word_boundary(TextPosition { text, pos }, direct, |c| is_word(c, words)),
                     expect,
                     "failed at case {i}.{j}",
                 );
             });
         });
+
+        let long_word_cases = &[(
+            "  Hello?@#$%^&*()世界<>!  ",
+            vec![
+                (0, Direction::Forward, 2usize),
+                (0, Direction::Backward, 0),
+                (2, Direction::Forward, 22),
+                (2, Direction::Backward, 2),
+                (21, Direction::Forward, 22),
+                (21, Direction::Backward, 2),
+                (22, Direction::Forward, 24),
+                (22, Direction::Backward, 22),
+            ],
+        )];
+        long_word_cases.iter().enumerate().for_each(|(i, t)| {
+            let (txt, case) = t;
+            case.iter().enumerate().for_each(|(j, &c)| {
+                let (pos, direct, expect) = c;
+                let rope = Rope::from_str(txt);
+                let text = rope.slice(..);
+                assert_eq!(
+                    // word_boundary(slice, pos, direct, words),
+                    word_boundary(TextPosition { text, pos }, direct, char::is_whitespace),
+                    expect,
+                    "failed at case {i}.{j}",
+                );
+            });
+        });
+
+        // [(sample, [(pos, type, long-word, slice-range)...])...]
+        let word_boundary_cases = &[
+            (
+                "  hello world  ",
+                vec![
+                    (0, TextObject::Inside, false, (0, 2)),
+                    (2, TextObject::Inside, false, (2, 7)),
+                    (0, TextObject::Around, false, (0, 7)),
+                    (2, TextObject::Around, false, (2, 8)),
+                ],
+            ),
+            (
+                "  Hello-world!  ",
+                vec![
+                    (0, TextObject::Inside, false, (0, 2)),
+                    (0, TextObject::Inside, true, (0, 2)),
+                    (0, TextObject::Around, false, (0, 7)),
+                    (0, TextObject::Around, true, (0, 14)),
+                    (2, TextObject::Inside, false, (2, 7)),
+                    (2, TextObject::Inside, true, (2, 14)),
+                    (2, TextObject::Around, false, (2, 7)),
+                    (2, TextObject::Around, true, (2, 16)),
+                ],
+            ),
+            (
+                "hello_world\ngood_bye",
+                vec![
+                    (0, TextObject::Inside, false, (0, 11)),
+                    (0, TextObject::Inside, true, (0, 11)),
+                    (0, TextObject::Around, false, (0, 11)),
+                    (0, TextObject::Around, true, (0, 11)),
+                    (11, TextObject::Inside, false, (11, 12)),
+                    (11, TextObject::Inside, true, (11, 12)),
+                    (11, TextObject::Around, false, (11, 12)),
+                    (11, TextObject::Around, true, (11, 12)),
+                ],
+            ),
+        ];
+        word_boundary_cases.iter().for_each(|t| {
+            let (sample, cases) = t;
+            let rope = Rope::from_str(sample);
+            let text = rope.slice(..);
+            cases.iter().for_each(|&case| {
+                let (pos, txt_obj, long_word, expected_slice) = case;
+                let range = Range::new(pos, pos + 1);
+                let res = textobject_word2(text, range, txt_obj, 1, long_word);
+                assert_eq!(
+                    res,
+                    expected_slice.into(),
+                    "\nfailed at {sample:?}, {case:?}",
+                );
+            })
+        })
+    }
+
+    #[test]
+    fn test_line() {
+        //[(text, [(position, type, long, range)...])...]
+        let test_cases = &[(
+            "  first line\n  second line  \nthird line  ",
+            //           c
+            vec![
+                (0, TextObject::Around, true, (0, 13)),
+                (0, TextObject::Around, false, (0, 12)),
+                // (0, TextObject::Inside, true, (2, 12)),
+                // (0, TextObject::Inside, false, (0, 11)),
+
+                // cursor at end of first line
+                (11, TextObject::Around, true, (0, 13)),
+                (11, TextObject::Around, false, (0, 12)),
+                // (0, TextObject::Inside, true, (2, 12)),
+                // (0, TextObject::Inside, false, (0, 11)),
+
+                //cursor at line-breaking of first line
+                (12, TextObject::Around, true, (0, 13)),
+                (12, TextObject::Around, false, (0, 12)),
+                // (12, TextObject::Inside, true, (2, 12)),
+                // (12, TextObject::Inside, false, (0, 11)),
+
+                //cursor at beginning of second line
+                (13, TextObject::Around, true, (13, 29)),
+                (13, TextObject::Around, false, (13, 28)),
+                //cursor at beginning of third line
+                (29, TextObject::Around, true, (29, 41)),
+                (29, TextObject::Around, false, (29, 41)),
+                //cursor at end of third line
+                (40, TextObject::Around, true, (29, 41)),
+            ],
+        )];
+
+        test_cases.iter().for_each(|t| {
+            let (sample, cases) = t;
+            let rope = Rope::from_str(sample);
+            let text = rope.slice(..);
+            cases.iter().for_each(|&case| {
+                let (pos, txt_obj, long, expected) = case;
+                let range = Range::new(pos, pos + 1);
+                assert_eq!(
+                    textobject_line(text, range, txt_obj, 1, long),
+                    expected.into(),
+                    "\nfailed at {sample:?}, {case:?}",
+                );
+            })
+        })
     }
 }
